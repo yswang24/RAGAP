@@ -16,14 +16,15 @@ labels = [x[0] for x in data]
 values = [x[1] for x in data]
 deltas = [x[2] for x in data]
 
-# A–F 对应实验说明（只保留这一列）
-legend_rows = [
-    ['A', 'Remove Protein nodes and related edges'],
-    ['B', 'Remove Taxonomy nodes and related edges'],
-    ['C', 'Remove Protein and Taxonomy'],
-    ['D', 'Fix relation weighting parameters to a constant'],
-    ['E', 'Replace with traditional BPR Pairwise Loss'],
-    ['F', 'Use MLP instead of Cosine Decoder'],
+# 将原图例信息直接整合进 x 轴刻度标签，减少图内文字干扰。
+tick_labels = [
+    'Full Model',
+    'A\nw/o Protein nodes\nand related edges',
+    'B\nw/o Taxonomy nodes\nand related edges',
+    'C\nw/o Protein and\nTaxonomy',
+    'D\nFixed relation\nweights',
+    'E\nBPR loss',
+    'F\nMLP decoder',
 ]
 
 # ================== 2. 风格设置 ==================
@@ -36,7 +37,7 @@ plt.rcParams.update({
     "savefig.bbox": "tight",
 })
 
-fig, ax = plt.subplots(figsize=(10, 6))
+fig, ax = plt.subplots(figsize=(11, 6.8))
 
 # ================== 3. 顶刊红色配色方案 ==================
 COLOR_BASE = '#b22222'     # 深红（Baseline）
@@ -97,15 +98,12 @@ for i in range(1, len(data)):
 
 # ================== 5. 坐标轴与网格 ==================
 ax.set_xticks(x)
-ax.set_xticklabels(labels, fontsize=10)
+ax.set_xticklabels(tick_labels, fontsize=9.5, linespacing=1.15)
+ax.tick_params(axis='x', length=0, pad=10)
 
 ax.set_ylabel('Hit@1 Accuracy', fontsize=11)
+ax.set_xlabel('Model Variant', fontsize=11, labelpad=12)
 ax.set_ylim(min(values) - 0.05, BASELINE_VAL + 0.06)
-
-ax.set_title(
-    'Ablation Study',
-    fontsize=12, loc='left', pad=16
-)
 
 # ✅ 显示 Y 轴（期刊推荐）
 ax.spines['left'].set_visible(True)
@@ -123,51 +121,6 @@ ax.grid(
     color=COLOR_GRID,
     zorder=0
 )
-
-# ================== 6. 右上角 A–F 实验说明表（精简版图例） ==================
-# ================== 6. 右上角图例（3 × 2，文本型 legend） ==================
-
-legend_items = [
-    ('A', 'Remove Protein nodes and related edges'),
-    ('B', 'Remove Taxonomy nodes and related edges'),
-    ('C', 'Remove Protein and Taxonomy'),
-    ('D', 'Fix relation weighting parameters to a constant'),
-    ('E', 'Replace with traditional BPR Pairwise Loss'),
-    ('F', 'Use MLP instead of Cosine Decoder'),
-]
-
-# 图例起始位置（axes 坐标系：0~1）
-x_left  = 0.20
-x_right = 0.60
-y_start = 0.98
-y_step  = 0.065
-
-# 左列：A B C
-for i, (key, text) in enumerate(legend_items[:3]):
-    ax.text(
-        x_left,
-        y_start - i * y_step,
-        f"{key}: {text}",
-        transform=ax.transAxes,
-        ha='left',
-        va='top',
-        fontsize=10,
-        color='black'
-    )
-
-# 右列：D E F
-for i, (key, text) in enumerate(legend_items[3:]):
-    ax.text(
-        x_right,
-        y_start - i * y_step,
-        f"{key}: {text}",
-        transform=ax.transAxes,
-        ha='left',
-        va='top',
-        fontsize=10,
-        color='black'
-    )
-
 
 # ================== 7. 输出 ==================
 plt.tight_layout()
