@@ -19,15 +19,34 @@ from torch_geometric.loader import LinkNeighborLoader
 import torch
 
 
-# --- 修改为以下设置 ---
-torch.backends.cudnn.benchmark = False          # 关闭自动寻找算法，保证稳定
-torch.backends.cudnn.deterministic = True       # 开启确定性模式，保证复现
-torch.backends.cuda.matmul.allow_tf32 = False   # 【关键】禁止矩阵乘法使用 TF32，强制使用 FP32
-torch.backends.cudnn.allow_tf32 = False         # 【关键】禁止卷积使用 TF32，强制使用 FP32
-# --------------------
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"invalid boolean value: {value}")
 
-print(f"Current GPU: {torch.cuda.get_device_name(0)}") 
-print(f"TF32 Allowed: {torch.backends.cuda.matmul.allow_tf32}")
+
+def configure_torch_runtime(
+    *,
+    enable_tf32: bool,
+    deterministic: bool,
+    cudnn_benchmark: bool,
+) -> None:
+    torch.backends.cuda.matmul.allow_tf32 = bool(enable_tf32)
+    torch.backends.cudnn.allow_tf32 = bool(enable_tf32)
+    torch.backends.cudnn.deterministic = bool(deterministic)
+    torch.backends.cudnn.benchmark = bool(cudnn_benchmark and not deterministic)
+    if hasattr(torch, 'set_float32_matmul_precision'):
+        try:
+            torch.set_float32_matmul_precision('high' if enable_tf32 else 'highest')
+        except Exception:
+            pass
+
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -73,6 +92,47 @@ def select_phage_host_relation(data: HeteroData):
     if preferred in data.edge_types:
         return preferred
     return None
+
+
+def add_train_only_infects_relations(
+    data: HeteroData,
+    relation: tuple[str, str, str],
+    train_edge_index: torch.Tensor,
+) -> tuple[HeteroData, tuple[str, str, str]]:
+    if relation != ('phage', 'infects', 'host'):
+        raise RuntimeError(f"Unexpected phage-host supervision relation: {relation}")
+    data[relation].edge_index = train_edge_index.contiguous()
+    reverse_relation = ('host', 'infected_by', 'phage')
+    data[reverse_relation].edge_index = train_edge_index[[1, 0], :].contiguous()
+    return data, reverse_relation
+
+
+def build_positive_host_map(
+    src_idx: torch.Tensor,
+    dst_idx: torch.Tensor,
+) -> dict[int, list[int]]:
+    pos_map: defaultdict[int, set[int]] = defaultdict(set)
+    for src, dst in zip(src_idx.tolist(), dst_idx.tolist()):
+        pos_map[int(src)].add(int(dst))
+    return {key: sorted(value) for key, value in pos_map.items()}
+
+
+def node_global_ids(batch: HeteroData, node_type: str, device: torch.device) -> torch.Tensor:
+    store = batch[node_type]
+    if hasattr(store, 'id') and store.id is not None:
+        return store.id.to(device=device, dtype=torch.long)
+    if hasattr(store, 'n_id') and store.n_id is not None:
+        return store.n_id.to(device=device, dtype=torch.long)
+    raise RuntimeError(f"{node_type} batch is missing both .id and .n_id")
+
+
+def encode_anchor_embeddings(
+    model: "GATv2MiniModel",
+    node_type: str,
+    x: torch.Tensor,
+) -> torch.Tensor:
+    hidden = F.relu(model.input_proj[node_type](x))
+    return F.normalize(model.final_proj[node_type](hidden), p=2, dim=-1)
 
 def find_phage_host_splits(data: HeteroData, ext_splits: typing.Union[dict, None]) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
     """
@@ -266,28 +326,104 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATv2Conv, HeteroConv
 
+
+def etype_key(etype: tuple[str, str, str]) -> str:
+    return f"{etype[0]}__{etype[1]}__{etype[2]}"
+
+
+class RelationAttentionGATv2Layer(nn.Module):
+    def __init__(
+        self,
+        node_types: tuple[str, ...],
+        edge_types: tuple[tuple[str, str, str], ...],
+        hidden_dim: int,
+        n_heads: int,
+        dropout: float,
+        use_edge_attr: bool,
+        edge_attr_dim: int,
+    ):
+        super().__init__()
+        self.node_types = list(node_types)
+        self.edge_types = list(edge_types)
+        self.use_edge_attr = use_edge_attr
+        self.dropout = nn.Dropout(dropout)
+        self.convs = nn.ModuleDict()
+        self.relation_gate = nn.ModuleDict()
+        self.norm = nn.ModuleDict()
+
+        for (src, rel, dst) in self.edge_types:
+            conv_kwargs = {
+                "in_channels": hidden_dim,
+                "out_channels": hidden_dim,
+                "heads": n_heads,
+                "concat": False,
+                "dropout": dropout,
+                "add_self_loops": src == dst,
+            }
+            if use_edge_attr:
+                conv_kwargs["edge_dim"] = edge_attr_dim
+            self.convs[etype_key((src, rel, dst))] = GATv2Conv(**conv_kwargs)
+
+        for node_type in self.node_types:
+            self.relation_gate[node_type] = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.Tanh(),
+                nn.Linear(hidden_dim, 1, bias=False),
+            )
+            self.norm[node_type] = nn.LayerNorm(hidden_dim)
+
+    def forward(
+        self,
+        h_dict: dict[str, torch.Tensor],
+        edge_index_dict: dict[tuple[str, str, str], torch.Tensor],
+        edge_attr_dict: typing.Optional[dict[tuple[str, str, str], torch.Tensor]] = None,
+    ) -> dict[str, torch.Tensor]:
+        relation_outputs: dict[str, list[torch.Tensor]] = {node_type: [] for node_type in self.node_types}
+
+        for etype, edge_index in edge_index_dict.items():
+            if edge_index is None or edge_index.numel() == 0:
+                continue
+            src_type, _, dst_type = etype
+            conv = self.convs[etype_key(etype)]
+            conv_kwargs = {}
+            if self.use_edge_attr and edge_attr_dict is not None and etype in edge_attr_dict:
+                conv_kwargs["edge_attr"] = edge_attr_dict[etype]
+            relation_outputs[dst_type].append(
+                conv((h_dict[src_type], h_dict[dst_type]), edge_index, **conv_kwargs)
+            )
+
+        out_dict = {}
+        for node_type in self.node_types:
+            residual = h_dict[node_type]
+            outputs = relation_outputs[node_type]
+            if outputs:
+                stacked = torch.stack(outputs, dim=1)
+                attn_logits = self.relation_gate[node_type](stacked).squeeze(-1)
+                attn_weights = torch.softmax(attn_logits, dim=1)
+                aggregated = torch.sum(stacked * attn_weights.unsqueeze(-1), dim=1)
+            else:
+                aggregated = torch.zeros_like(residual)
+            updated = self.norm[node_type](residual + self.dropout(aggregated))
+            out_dict[node_type] = F.relu(updated)
+        return out_dict
+
+
 class GATv2MiniModel(nn.Module):
     def __init__(
         self,
-        metadata: tuple,                 # (node_types, edge_types)
-        in_dims: dict,                   # {ntype: in_dim}
+        metadata: tuple,
+        in_dims: dict,
         hidden_dim: int = 256,
         out_dim: int = 256,
         n_layers: int = 2,
         n_heads: int = 4,
         dropout: float = 0.2,
         decoder: str = "mlp",
-        use_edge_attr: bool = True,      # 是否启用 edge_attr 支持
-        edge_attr_dim: int = 1,          # edge_attr 的维度（1 表示标量权重）
+        use_edge_attr: bool = True,
+        edge_attr_dim: int = 1,
         rel_init_map: typing.Optional[dict] = None,
+        relation_aggr: str = "sum",
     ):
-        """
-        GATv2MiniModel for heterogeneous graphs using HeteroConv(GATv2Conv).
-        - metadata: (node_types_list, edge_types_list), where edge_types are tuples (src, rel, dst)
-        - in_dims: dict mapping node type -> input feature dim
-        - use_edge_attr: whether to pass edge_attr to GATv2Conv (requires GATv2Conv to support edge_dim)
-        - edge_attr_dim: number of channels for edge_attr (1 for scalar weight)
-        """
         super().__init__()
         self.metadata = metadata
         self.node_types, self.edge_types = metadata
@@ -298,9 +434,11 @@ class GATv2MiniModel(nn.Module):
         self.dropout_p = dropout
         self.use_edge_attr = use_edge_attr
         self.edge_attr_dim = edge_attr_dim
-        self.rel_init_map = rel_init_map # 先存起来
+        self.rel_init_map = rel_init_map
+        self.relation_aggr = relation_aggr
+        if self.relation_aggr not in {"sum", "attention"}:
+            raise ValueError(f"Unsupported relation_aggr: {self.relation_aggr}")
 
-        # 输入投影（每种节点类型投到 hidden_dim）
         self.input_proj = nn.ModuleDict()
         for n in self.node_types:
             d = in_dims.get(n)
@@ -308,150 +446,125 @@ class GATv2MiniModel(nn.Module):
                 raise RuntimeError(f"Missing in_dim for node type {n}")
             self.input_proj[n] = nn.Linear(d, hidden_dim)
 
-        # 使用 concat=False（输出维度由 out_channels 决定），避免 hidden_dim 必须可被 n_heads 整除
         concat_flag = False
         out_channels = hidden_dim
 
-        # 为每一层创建 ModuleDict（字符串键）来注册 GATv2Conv 子模块，并构造对应的 HeteroConv
         self.edge_conv_md_list = nn.ModuleList()
         self.layers = nn.ModuleList()
-        for _ in range(n_layers):
-            convs_md = nn.ModuleDict()
-            for (src, rel, dst) in self.edge_types:
-                str_key = f"{src}__{rel}__{dst}"
-                # 对于异构边 (src != dst) 强制禁用 self-loops（add_self_loops=False）
-                add_self_loops_flag = (src == dst)
-
-                if self.use_edge_attr:
-                    # 注意：GATv2Conv 必须支持 edge_dim 参数（某些旧版本 PyG 不支持）
-                    conv = GATv2Conv(
-                        in_channels=hidden_dim,
-                        out_channels=out_channels,
-                        heads=n_heads,
-                        concat=concat_flag,
+        if self.relation_aggr == "attention":
+            for _ in range(n_layers):
+                self.layers.append(
+                    RelationAttentionGATv2Layer(
+                        tuple(self.node_types),
+                        tuple(self.edge_types),
+                        hidden_dim=hidden_dim,
+                        n_heads=n_heads,
                         dropout=dropout,
-                        edge_dim=self.edge_attr_dim,
-                        add_self_loops=add_self_loops_flag
+                        use_edge_attr=use_edge_attr,
+                        edge_attr_dim=edge_attr_dim,
                     )
-                else:
-                    conv = GATv2Conv(
-                        in_channels=hidden_dim,
-                        out_channels=out_channels,
-                        heads=n_heads,
-                        concat=concat_flag,
-                        dropout=dropout,
-                        add_self_loops=add_self_loops_flag
-                    )
-                convs_md[str_key] = conv
-
-            # 保存 ModuleDict（参数会被正确注册）
-            self.edge_conv_md_list.append(convs_md)
-
-            # 构造 HeteroConv 需要的映射： (src,rel,dst) -> module
-            conv_map = {
-                et: convs_md[f"{et[0]}__{et[1]}__{et[2]}"] for et in self.edge_types
-            }
-            self.layers.append(HeteroConv(conv_map, aggr='sum'))##把这一层所有关系的 GATv2Conv 组合成一个 HeteroConv，跨关系的聚合方式用 'sum'（可改 mean、max 等，sum 对信号保真度高）。
+                )
+        else:
+            for _ in range(n_layers):
+                convs_md = nn.ModuleDict()
+                for (src, rel, dst) in self.edge_types:
+                    str_key = etype_key((src, rel, dst))
+                    add_self_loops_flag = (src == dst)
+                    if self.use_edge_attr:
+                        conv = GATv2Conv(
+                            in_channels=hidden_dim,
+                            out_channels=out_channels,
+                            heads=n_heads,
+                            concat=concat_flag,
+                            dropout=dropout,
+                            edge_dim=self.edge_attr_dim,
+                            add_self_loops=add_self_loops_flag,
+                        )
+                    else:
+                        conv = GATv2Conv(
+                            in_channels=hidden_dim,
+                            out_channels=out_channels,
+                            heads=n_heads,
+                            concat=concat_flag,
+                            dropout=dropout,
+                            add_self_loops=add_self_loops_flag,
+                        )
+                    convs_md[str_key] = conv
+                self.edge_conv_md_list.append(convs_md)
+                conv_map = {et: convs_md[etype_key(et)] for et in self.edge_types}
+                self.layers.append(HeteroConv(conv_map, aggr='sum'))
 
         self.dropout = nn.Dropout(self.dropout_p)
-
-        # 输出投影 + decoder（与原 HGTMiniModel 保持行为一致）
         self.final_proj = nn.ModuleDict({n: nn.Linear(hidden_dim, out_dim) for n in self.node_types})
         self.edge_mlp = nn.Sequential(nn.Linear(2 * out_dim, out_dim), nn.ReLU(), nn.Linear(out_dim, 1))
         if decoder == "mlp":
             self.decoder_mlp = self.edge_mlp
 
-        # ========== 新增: 可学习的 logit scale（以 log-space 存放） ==========
-        # 用 exp(self.logit_scale) 作为实际放缩系数 (保证正)
-        # 初始为 0.0 -> scale = 1.0；如需更大初始 scale 可改为 torch.log(torch.tensor(5.0))
         self.logit_scale = nn.Parameter(torch.tensor(1.0))
-        # __init__ 末尾处（logit_scale 后）新增
         self.rel_logw = nn.ParameterDict()
-        # 可选：传入一个初始化map，没传则默认1.0
         rel_init_map = getattr(self, "rel_init_map", None)
-
-        for (src, rel, dst) in self.edge_types:
-            if rel_init_map is not None and (src, rel, dst) in rel_init_map:
-                init_w = float(rel_init_map[(src, rel, dst)])
+        for etype in self.edge_types:
+            if rel_init_map is not None and etype in rel_init_map:
+                init_w = float(rel_init_map[etype])
             else:
-                # 没给就用 1.0；你也可以在这里写死一些常用先验
                 init_w = 1.0
             p = nn.Parameter(torch.log(torch.tensor(init_w, dtype=torch.float)))
-            self.rel_logw[f"{src}__{rel}__{dst}"] = p
-
+            self.rel_logw[etype_key(etype)] = p
 
     def forward(
         self,
         x_dict: dict[str, torch.Tensor],
         edge_index_dict: dict[tuple, torch.Tensor],
-        edge_attr_dict: typing.Optional[dict] = None,   # etype -> tensor/float
+        edge_attr_dict: typing.Optional[dict] = None,
     ) -> dict[str, torch.Tensor]:
-
-        # 1) 节点特征输入投影
         h = {n: F.relu(self.input_proj[n](x)) for n, x in x_dict.items()}
-        # 2) 逐层消息传递
-        for i, layer in enumerate(self.layers):  # <--- 改成 enumerate 以便知道是第几层
-            
-
+        for layer in self.layers:
+            processed = None
             if self.use_edge_attr:
                 processed = {}
                 for etype, edge_index in edge_index_dict.items():
                     E = edge_index.size(1)
-                    key = f"{etype[0]}__{etype[1]}__{etype[2]}"
-                    # 可学习的“关系门控”，标量 > 0
-                    alpha = torch.exp(self.rel_logw[key])  # shape: (), 标量
-
-                    # 逐边数值 v_e：若传了 edge_attr_dict[etype] 就用它，否则用 1
+                    key = etype_key(etype)
+                    alpha = torch.exp(self.rel_logw[key])
                     if edge_attr_dict is not None and etype in edge_attr_dict:
                         v = edge_attr_dict[etype]
                         if not torch.is_tensor(v):
-                            # 标量 -> (E, edge_attr_dim)
                             v = torch.full(
                                 (E, self.edge_attr_dim),
                                 float(v),
                                 dtype=torch.float,
-                                device=edge_index.device
+                                device=edge_index.device,
                             )
                         else:
                             v = v.to(edge_index.device)
-                            # 统一形状为 (E, edge_attr_dim)
                             if v.dim() == 1:
-                                v = v.view(-1, 1)  # -> (E,1)
+                                v = v.view(-1, 1)
                             elif v.dim() == 2:
                                 if v.size(1) != self.edge_attr_dim:
-                                    # 若维度不对，截断或pad；这里选择截断到需要的维度
                                     if v.size(1) > self.edge_attr_dim:
                                         v = v[:, :self.edge_attr_dim]
                                     else:
-                                        pad = self.edge_attr_dim - v.size(1)
-                                        v = F.pad(v, (0, pad), value=1.0)  # 用1补齐
+                                        v = F.pad(v, (0, self.edge_attr_dim - v.size(1)), value=1.0)
                             else:
                                 raise RuntimeError(f"edge_attr for {etype} must be 1D or 2D tensor")
                             if v.size(0) != E:
-                                raise RuntimeError(f"edge_attr for {etype} length {v.size(0)} != edge count {E}")
+                                raise RuntimeError(
+                                    f"edge_attr for {etype} length {v.size(0)} != edge count {E}"
+                                )
                     else:
-                        # 没传逐边数值 -> 用全1
                         v = torch.ones((E, self.edge_attr_dim), device=edge_index.device)
-
-                    # 关系门控乘逐边数值 -> 最终喂给 GATv2
-                    # alpha 标量 -> 扩展成 (E, edge_attr_dim) 参与广播
                     processed[etype] = v * alpha
-
-                # 以 *_dict 格式传入，HeteroConv 会把它展开为 edge_attr=...
-                # ========== 【关键动作：调用层】 ==========
+            if self.relation_aggr == "attention":
                 h = layer(h, edge_index_dict, edge_attr_dict=processed)
             else:
-                # 不使用边特征
-                h = layer(h, edge_index_dict)
-            
-            # 激活 + dropout
-            for k in list(h.keys()):
-                h[k] = F.relu(self.dropout(h[k]))
-
-        # 3) 输出投影 + L2 归一化（配合 cosine 解码）
+                if self.use_edge_attr:
+                    h = layer(h, edge_index_dict, edge_attr_dict=processed)
+                else:
+                    h = layer(h, edge_index_dict)
+                for k in list(h.keys()):
+                    h[k] = F.relu(self.dropout(h[k]))
         out = {k: F.normalize(self.final_proj[k](v), p=2, dim=-1) for k, v in h.items()}
         return out
-
 
     def decode(
         self,
@@ -459,7 +572,6 @@ class GATv2MiniModel(nn.Module):
         edge_label_index: typing.Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]],
         etype: tuple[str, str, str]
     ) -> torch.Tensor:
-        # same interface as your original HGTMiniModel.decode
         if isinstance(edge_label_index, torch.Tensor) and edge_label_index.dim() == 2 and edge_label_index.size(0) == 2:
             src_idx, dst_idx = edge_label_index[0], edge_label_index[1]
         elif isinstance(edge_label_index, (tuple, list)) and len(edge_label_index) == 2:
@@ -472,11 +584,9 @@ class GATv2MiniModel(nn.Module):
         dst_z = z_dict[dst_type][dst_idx]
 
         if self.decoder_type == "cosine":
-            # 防御性归一化（如果 forward 已归一化这一步是幂等的）
             src_n = F.normalize(src_z, p=2, dim=-1)
             dst_n = F.normalize(dst_z, p=2, dim=-1)
-            sim = F.cosine_similarity(src_n, dst_n)   # in [-1,1]
-            # 用可学习的 scale 放大 logits（保证为正）
+            sim = F.cosine_similarity(src_n, dst_n)
             return sim * torch.exp(self.logit_scale)
         elif self.decoder_type == "mlp":
             e = torch.cat([src_z, dst_z], dim=-1)
@@ -1084,14 +1194,28 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--num_neighbors", nargs='+', type=int, default=[15,10], help="neighbors per hop, e.g. --num_neighbors 15 10")
     p.add_argument("--batch_size", type=int, default=2048, help="positive edges per batch")
-    p.add_argument("--neg_ratio", type=int, default=1, help="negatives per positive in training batch")
+    p.add_argument("--neg_ratio", type=int, default=1, help="compatibility alias for hard negatives when --hard_negatives is unset")
+    p.add_argument("--hard_negatives", type=int, default=None, help="number of in-batch hard negatives per positive")
+    p.add_argument("--tau", type=float, default=0.1, help="temperature used by the full-host softmax loss")
     p.add_argument("--eval_neg_ratio", type=int, default=1)
     p.add_argument("--save_path", default="best_hgt_nb.pt")
-    p.add_argument("--log_every", type=int, default=1)
+    p.add_argument("--log_every", type=int, default=None, help="compatibility alias for eval_every when --eval_every is unset")
+    p.add_argument("--train_log_every", type=int, default=100)
+    p.add_argument("--eval_every", type=int, default=None)
+    p.add_argument("--loader_workers", type=int, default=8)
+    p.add_argument("--pin_memory", type=str2bool, default=True)
+    p.add_argument("--save_eval_predictions", type=str2bool, default=False)
+    p.add_argument("--save_final_predictions", type=str2bool, default=True)
+    p.add_argument("--enable_tf32", type=str2bool, default=True)
+    p.add_argument("--deterministic", type=str2bool, default=False)
+    p.add_argument("--cudnn_benchmark", type=str2bool, default=True)
+    p.add_argument("--patience", type=int, default=6, help="number of evaluation points without val_mrr improvement before early stop")
 
     # NEW: node maps path (统一默认 node_maps.json)
     p.add_argument("--node_maps", default="node_maps_cluster_650.json", help="JSON file mapping node ids (phage_map, host_map). Default: node_maps.json")
     p.add_argument("--out_dir", default="outputs", help="directory to place all outputs (checkpoints, predictions, debug files)")
+    p.add_argument("--host_cache_refresh_every", type=int, default=1, help="refresh the detached full-graph host cache every N epochs")
+    p.add_argument("--relation_aggr", choices=["sum", "attention"], default="sum", help="cross-relation aggregation mode")
     return p.parse_args()
 
 def bpr_loss(pos_scores, neg_scores):
@@ -1115,68 +1239,136 @@ def softmax_ce_loss(
     host_emb_batch: torch.Tensor,
     pos_phage_local_idx: torch.LongTensor,
     pos_host_local_idx: torch.LongTensor,
-    tau: float = 0.05,           # 建议手动固定一个小温度，如 0.05
+    tau: float = 1.0,
     logit_scale: torch.Tensor = None,
-    num_hard_negatives: int = 0  # 核心参数：>0 时启用困难负采样
-):
-    """
-    带困难负采样 (Hard Negative Mining) 的 InfoNCE Loss
-    """
+) -> torch.Tensor:
     device = phage_emb_batch.device
     pos_phage_local_idx = pos_phage_local_idx.to(device)
     pos_host_local_idx = pos_host_local_idx.to(device)
 
-    # 1. 选取正样本对应的 Phage 向量 (N_pos, D)
     phage_vecs = phage_emb_batch[pos_phage_local_idx]
-
-    # 2. 计算全量相似度矩阵 (N_pos, H_batch)
-    # logits[i, j] 代表第 i 个 phage 与 Batch 内第 j 个 host 的相似度
     logits = torch.matmul(phage_vecs, host_emb_batch.t())
 
-    # 3. 处理温度系数 / 缩放
     if logit_scale is not None:
-        # 如果你想用自动学习的 scale，就解开这里
         scale = torch.clamp(logit_scale, max=4.6).exp()
         logits = logits * scale
     else:
-        # 推荐：手动固定 tau，更稳定
         logits = logits / tau
 
-    # 4. 提取正样本的分数 (N_pos, 1)
-    # 从每一行中，把正确答案的那一列分数抠出来
-    pos_logits = logits.gather(1, pos_host_local_idx.view(-1, 1))
+    labels = pos_host_local_idx.long()
+    return F.cross_entropy(logits, labels, reduction='mean')
 
-    # ================= 核心：困难负采样逻辑 =================
-    if num_hard_negatives > 0 and num_hard_negatives < logits.size(1) - 1:
-        # A. 创建掩码：屏蔽掉正样本
-        # 我们不希望把“正样本”误当成“困难负样本”选进去
-        mask = torch.zeros_like(logits, dtype=torch.bool)
-        mask.scatter_(1, pos_host_local_idx.view(-1, 1), True)
-        
-        # B. 将正样本位置的分数设为负无穷，方便 topk 筛选
-        neg_candidates = logits.masked_fill(mask, -1e9)
+def multi_positive_full_host_softmax_loss(
+    phage_emb_batch: torch.Tensor,
+    host_emb_all: torch.Tensor,
+    positive_mask: torch.Tensor,
+    tau: float = 0.05,
+    logit_scale: torch.Tensor = None,
+) -> torch.Tensor:
+    """
+    Full-host softmax with multi-positive masking.
+    Each phage row is optimized against all host candidates, while multiple true
+    hosts for the same phage share the positive probability mass.
+    """
+    if phage_emb_batch.dim() != 2 or host_emb_all.dim() != 2:
+        raise RuntimeError('phage_emb_batch and host_emb_all must both be 2D tensors')
+    if positive_mask.dim() != 2:
+        raise RuntimeError('positive_mask must be a 2D tensor')
+    if positive_mask.size(0) != phage_emb_batch.size(0):
+        raise RuntimeError('positive_mask row count must match phage_emb_batch')
+    if positive_mask.size(1) != host_emb_all.size(0):
+        raise RuntimeError('positive_mask column count must match host_emb_all')
+    if tau <= 0:
+        raise RuntimeError('tau must be > 0')
 
-        # C. 筛选 Top-K 困难负样本
-        # 从每一行中，选出分数最高的 num_hard_negatives 个负样本
-        hard_neg_logits, _ = neg_candidates.topk(num_hard_negatives, dim=1)
+    positive_mask = positive_mask.bool()
+    valid_rows = positive_mask.any(dim=1)
+    if not valid_rows.any():
+        raise RuntimeError('multi-positive loss received no valid positive rows')
+    if not valid_rows.all():
+        phage_emb_batch = phage_emb_batch[valid_rows]
+        positive_mask = positive_mask[valid_rows]
 
-        # D. 拼接：新的 Logits = [正样本分数, K个困难负样本分数]
-        # 形状变为 (N_pos, 1 + K)
-        final_logits = torch.cat([pos_logits, hard_neg_logits], dim=1)
-        
-        # E. 生成标签：正样本现在固定在第 0 列
-        target_labels = torch.zeros(logits.size(0), dtype=torch.long, device=device)
-    
+    logits = torch.matmul(phage_emb_batch, host_emb_all.t())
+    if logit_scale is not None:
+        logits = logits * torch.clamp(logit_scale, max=4.6).exp()
     else:
-        # 如果不启用困难负采样，回退到普通的全量 Softmax
-        final_logits = logits
-        target_labels = pos_host_local_idx
-    # ==========================================================
+        logits = logits / tau
 
-    # 5. 计算交叉熵损失
-    loss = F.cross_entropy(final_logits, target_labels, reduction='mean')
-    
-    return loss
+    logits = logits - logits.max(dim=1, keepdim=True).values.detach()
+    positive_logits = logits.masked_fill(~positive_mask, torch.finfo(logits.dtype).min)
+    log_num = torch.logsumexp(positive_logits, dim=1)
+    log_den = torch.logsumexp(logits, dim=1)
+    return -(log_num - log_den).mean()
+
+
+def build_edge_attr_dict_from_data(
+    data: HeteroData,
+    edge_index_dict: dict[tuple[str, str, str], torch.Tensor],
+    device: torch.device,
+    edge_type_weight_map: typing.Optional[dict[tuple[str, str, str], float]] = None,
+) -> dict[tuple[str, str, str], torch.Tensor]:
+    edge_type_weight_map = edge_type_weight_map or {}
+    edge_attr_dict: dict[tuple[str, str, str], torch.Tensor] = {}
+    for etype, edge_index in edge_index_dict.items():
+        E = edge_index.size(1)
+        if hasattr(data[etype], 'edge_weight') and data[etype].edge_weight is not None:
+            edge_attr_dict[etype] = data[etype].edge_weight.to(device)
+        elif etype in edge_type_weight_map:
+            edge_attr_dict[etype] = torch.full((E,), float(edge_type_weight_map[etype]), device=device)
+    return edge_attr_dict
+
+
+@torch.no_grad()
+def refresh_full_host_cache(
+    model: GATv2MiniModel,
+    data: HeteroData,
+    compute_device: torch.device,
+    target_device: torch.device,
+    edge_type_weight_map: typing.Optional[dict[tuple[str, str, str], float]] = None,
+) -> torch.Tensor:
+    was_training = model.training
+    original_device = next(model.parameters()).device
+    compute_device = torch.device(compute_device)
+    target_device = torch.device(target_device)
+
+    if original_device != compute_device:
+        model.to(compute_device)
+    model.eval()
+
+    full_x = {ntype: data[ntype].x.to(compute_device) for ntype in data.node_types}
+    full_edge_index_dict = {
+        etype: data[etype].edge_index.to(compute_device)
+        for etype in data.edge_types
+        if hasattr(data[etype], 'edge_index') and data[etype].edge_index is not None
+    }
+    full_edge_attr = build_edge_attr_dict_from_data(
+        data,
+        full_edge_index_dict,
+        device=compute_device,
+        edge_type_weight_map=edge_type_weight_map,
+    )
+    out_full = model(
+        full_x,
+        full_edge_index_dict,
+        edge_attr_dict=full_edge_attr if full_edge_attr else None,
+    )
+    host_cache = out_full['host'].detach().to(target_device)
+
+    del out_full
+    del full_x
+    del full_edge_index_dict
+    del full_edge_attr
+
+    if original_device != compute_device:
+        model.to(original_device)
+    if was_training:
+        model.train()
+    if original_device.type == 'cuda':
+        torch.cuda.empty_cache()
+    return host_cache
+
+
 import pandas as pd
 import random
 import os
@@ -1193,19 +1385,44 @@ import torch.nn.functional as F
 def main():
     # ---------- 在 main() 里唯一定义 edge_type_weight_map ----------
     edge_type_weight_map = {
-        # ('phage', 'infects', 'host'): 3.0,
-        # #('protein', 'similar', 'protein'): 0.8,
+        ('phage', 'infects', 'host'): 3.0,
+        # ('protein', 'similar', 'protein'): 0.8,
         # ('host', 'has_sequence', 'host_sequence'): 1.0,
-        # ('phage', 'interacts', 'phage'): 3.0,
-        # #('host', 'interacts', 'host'): 1.0,
+        ('phage', 'interacts', 'phage'): 2.0,
+        # ('host', 'interacts', 'host'): 1.0,
         # ('phage', 'encodes', 'protein'): 0.5,
         # ('host', 'encodes', 'protein'): 0.5,
-        # ('host', 'belongs_to', 'taxonomy'): 3.0,
-        # ('taxonomy', 'related', 'taxonomy'): 3.0,
-        # #('phage', 'belongs_to', 'taxonomy'): 1.0,
+        ('host', 'belongs_to', 'taxonomy'): 3.0,
+        # ('taxonomy', 'related', 'taxonomy'): 2.5,
+        # ('phage', 'belongs_to', 'taxonomy'): 1.0,
     }
 
     args = parse_args()
+    if args.tau <= 0:
+        raise ValueError("--tau must be > 0")
+    effective_hard_negatives = args.hard_negatives if args.hard_negatives is not None else args.neg_ratio
+    if effective_hard_negatives < 0:
+        raise ValueError("--hard_negatives/--neg_ratio must be >= 0")
+    if args.patience < 0:
+        raise ValueError("--patience must be >= 0")
+    if args.train_log_every <= 0:
+        raise ValueError("--train_log_every must be > 0")
+    effective_eval_every = args.eval_every if args.eval_every is not None else args.log_every
+    if effective_eval_every is None:
+        effective_eval_every = 1000
+    if effective_eval_every <= 0:
+        raise ValueError("--eval_every/--log_every must be > 0")
+    if args.loader_workers < 0:
+        raise ValueError("--loader_workers must be >= 0")
+    if args.host_cache_refresh_every <= 0:
+        raise ValueError("--host_cache_refresh_every must be > 0")
+
+    configure_torch_runtime(
+        enable_tf32=args.enable_tf32,
+        deterministic=args.deterministic,
+        cudnn_benchmark=args.cudnn_benchmark,
+    )
+
     # ---- create output dir and subdirs ----
     out_dir = os.path.abspath(args.out_dir)
     os.makedirs(out_dir, exist_ok=True)
@@ -1242,6 +1459,20 @@ def main():
     set_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     eval_device = torch.device(args.eval_device)
+    loader_num_workers = int(args.loader_workers)
+    loader_pin_memory = bool(args.pin_memory and device.type == 'cuda')
+    loader_persistent_workers = bool(loader_num_workers > 0)
+
+    if torch.cuda.is_available():
+        gpu_index = device.index if device.type == 'cuda' and device.index is not None else 0
+        logger.info("Current GPU: %s", torch.cuda.get_device_name(gpu_index))
+    logger.info(
+        "Runtime flags: tf32=%s deterministic=%s cudnn_benchmark=%s eval_device=%s",
+        args.enable_tf32,
+        args.deterministic,
+        args.cudnn_benchmark,
+        eval_device,
+    )
 
     logger.info("Loading data: %s", args.data_pt)
     data, split_edge = safe_torch_load(args.data_pt)
@@ -1265,6 +1496,19 @@ def main():
         in_dims[n] = data[n].x.size(1)
         logger.info("node %s in_dim = %d", n, in_dims[n])
 
+    relation = select_phage_host_relation(data)
+    if relation is None:
+        raise RuntimeError("phage->host relation not found")
+
+    train_edge_index = torch.stack([train_src_cpu, train_dst_cpu], dim=0)
+    relation_edge_count = int(data[relation].edge_index.size(1)) if hasattr(data[relation], 'edge_index') and data[relation].edge_index is not None else 0
+    logger.info(
+        "Using original graph message-passing edges for %s=%d; train supervision edges=%d",
+        relation,
+        relation_edge_count,
+        train_edge_index.size(1),
+    )
+
     logger.info("Instantiating model...")
 
     model = GATv2MiniModel(
@@ -1279,6 +1523,7 @@ def main():
         use_edge_attr=True,
         edge_attr_dim=1,
         rel_init_map=edge_type_weight_map,
+        relation_aggr=args.relation_aggr,
     ).to(device)
 
     optimizer = torch.optim.AdamW([
@@ -1287,16 +1532,11 @@ def main():
         {"params": list(model.rel_logw.parameters()), "lr": args.lr * 0.1}
     ], weight_decay=1e-5)
     
-    loss_fn = softmax_ce_loss  # 你自定义的对比损失
+    loss_fn = softmax_ce_loss
+    train_positive_host_map = build_positive_host_map(train_src_cpu, train_dst_cpu)
+    multi_positive_phages = sum(1 for hosts in train_positive_host_map.values() if len(hosts) > 1)
+    max_hosts_per_phage = max((len(hosts) for hosts in train_positive_host_map.values()), default=0)
 
-    relation = select_phage_host_relation(data)
-    if relation is None:
-        raise RuntimeError("phage->host relation not found")
-
-    train_edge_index = torch.stack([train_src_cpu, train_dst_cpu], dim=0)
-    # === 新增（一行，关键！）：只用训练真边做消息传递，避免泄漏 ===
-    data[relation].edge_index = train_edge_index
-    
     train_loader = LinkNeighborLoader(
         data,
         num_neighbors={etype: args.num_neighbors for etype in data.edge_types},
@@ -1304,9 +1544,34 @@ def main():
         edge_label=torch.ones(train_edge_index.size(1), dtype=torch.float),
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0
+        num_workers=loader_num_workers,
+        pin_memory=loader_pin_memory,
+        persistent_workers=loader_persistent_workers,
     )
     logger.info("Train loader created. batches: %d", len(train_loader))
+    logger.info(
+        "Training hyperparameters: tau=%.4f patience=%d num_neighbors=%s batch_size=%d hard_negatives_ignored=%d train_log_every=%d eval_every=%d",
+        args.tau,
+        args.patience,
+        args.num_neighbors,
+        args.batch_size,
+        effective_hard_negatives,
+        args.train_log_every,
+        effective_eval_every,
+    )
+    logger.info(
+        "Data loader: workers=%d pin_memory=%s persistent_workers=%s",
+        loader_num_workers,
+        loader_pin_memory,
+        loader_persistent_workers,
+    )
+    logger.info(
+        "Training objective: in-batch host softmax CE; relation_aggr=%s; multi-host phages=%d/%d max_hosts_per_phage=%d",
+        args.relation_aggr,
+        multi_positive_phages,
+        len(train_positive_host_map),
+        max_hosts_per_phage,
+    )
 
     taxid2species = None
     host_id2taxid = None
@@ -1318,11 +1583,10 @@ def main():
         else:
             logger.warning("data['host'] missing .taxid, species-level eval disabled")
 
-    # Only train positives for filtering to avoid leakage
-    train_pos_edges = set(zip(train_src_cpu.tolist(), train_dst_cpu.tolist()))
-
     best_val_auc = -1.0
     best_val_mrr = -1.0
+    best_epoch = 0
+    evals_without_improve = 0
     best_ckpt = None
 
     for epoch in range(1, args.epochs + 1):
@@ -1363,29 +1627,22 @@ def main():
                 continue
 
             # out 已由 model(...) 返回，为字典：out['phage'], out['host'], ...
-            # 获取本 batch 的 phage / host embedding 矩阵（局部索引空间）
-            phage_emb_batch = out['phage']   # shape (P_batch, D)
-            host_emb_batch = out['host']     # shape (H_batch, D)
+            phage_emb_batch = out['phage']
+            host_emb_batch = out['host']
 
             # positive pairs (local indices in this batch's phage/host sets)
-            pos_src_local = edge_label_index[0].to(device)  # (num_pos,)
-            pos_dst_local = edge_label_index[1].to(device)  # (num_pos,)
+            pos_src_local = edge_label_index[0].to(device)
+            pos_dst_local = edge_label_index[1].to(device)
+            if pos_src_local.numel() == 0:
+                continue
 
-            # Compute in-batch softmax CE loss.
-            # Treat host_emb_batch as the classification candidates for each phage vector.
-            loss = softmax_ce_loss(
-                phage_emb_batch, 
-                host_emb_batch, 
-                pos_src_local, 
+            loss = loss_fn(
+                phage_emb_batch,
+                host_emb_batch,
+                pos_src_local,
                 pos_dst_local,
-                
-                # 1. 这里建议手动固定 tau，比自动学习更稳，更能逼出模型潜力
-                tau=0.1,           
-                logit_scale=None,   
-                
-                # 2. 核心参数：从当前 Batch (假设2048) 中选出最难的 150 个进行训练
-                # 如果这个数设为 0，就等同于原来的 loss
-                num_hard_negatives=150
+                tau=args.tau,
+                logit_scale=model.logit_scale,
             )
             
             # 反向传播
@@ -1415,30 +1672,40 @@ def main():
         
         t1 = time.time()
         avg_loss = epoch_loss / max(1, n_batches)
+        train_time_s = t1 - t0
 
-        if epoch % args.log_every == 0 or epoch == args.epochs:
+        if epoch % args.train_log_every == 0 or epoch == args.epochs:
+            logger.info(
+                "[Epoch %03d] train_loss=%.6f train_time=%.1fs batches=%d",
+                epoch,
+                avg_loss,
+                train_time_s,
+                n_batches,
+            )
+
+        if epoch % effective_eval_every == 0 or epoch == args.epochs:
             try:
+                eval_save_path = os.path.join(preds_dir, "phage_prediction_results") if args.save_eval_predictions else None
                 train_metrics, val_metrics, test_metrics = compute_metrics_fullgraph(
                     model, data, train_pair, val_pair, test_pair, relation=relation,
                     eval_device=args.eval_device, eval_neg_ratio=args.eval_neg_ratio,
-                    host_id2taxid=host_id2taxid, taxid2species=taxid2species, k_list=(1, 5, 10, 20, 30), # <- 这里加上
-                    save_path=os.path.join(preds_dir, "phage_prediction_results"),  node_maps_path=args.node_maps,
+                    host_id2taxid=host_id2taxid, taxid2species=taxid2species, k_list=(1, 5, 10, 20, 30),
+                    save_path=eval_save_path, node_maps_path=args.node_maps,
                     edge_type_weight_map=edge_type_weight_map
                 )
                 train_auc, train_mrr, train_hits = train_metrics
                 val_auc, val_mrr, val_hits = val_metrics
                 test_auc, test_mrr, test_hits = test_metrics
 
-                # Save predictions with epoch suffix
-                pred_file = os.path.join(preds_dir, f"phage_prediction_results_epoch_{epoch}.tsv")
-                
-                save_predictions(
-                    model, data, test_src_cpu, test_dst_cpu, relation, 
-                    eval_device, host_id2taxid, taxid2species, 
-                    output_file=pred_file, k_list=(30,),
-                    edge_type_weight_map=edge_type_weight_map,
-                    node_maps_path=args.node_maps
-                )
+                if args.save_eval_predictions:
+                    pred_file = os.path.join(preds_dir, f"phage_prediction_results_epoch_{epoch}.tsv")
+                    save_predictions(
+                        model, data, test_src_cpu, test_dst_cpu, relation,
+                        eval_device, host_id2taxid, taxid2species,
+                        output_file=pred_file, k_list=(30,),
+                        edge_type_weight_map=edge_type_weight_map,
+                        node_maps_path=args.node_maps
+                    )
 
             except Exception as e:
                 logger.warning("Full-graph eval failed: %s", e)
@@ -1448,11 +1715,19 @@ def main():
                 train_mrr = val_mrr = test_mrr = 0.0
                 train_hits = val_hits = test_hits = {k: 0.0 for k in (1, 5, 10)}
 
-            logger.info("[Epoch %03d] loss=%.6f time=%.1fs val_auc=%.4f val_mrr=%.4f hits@1/5/10=%s",
-                        epoch, avg_loss, t1 - t0, val_auc, val_mrr, val_hits)
+            logger.info(
+                "[Eval %03d] val_auc=%.4f val_mrr=%.4f hits@1/5/10=%s",
+                epoch,
+                val_auc,
+                val_mrr,
+                val_hits,
+            )
 
             if val_mrr > best_val_mrr:
+                best_val_auc = val_auc
                 best_val_mrr = val_mrr
+                best_epoch = epoch
+                evals_without_improve = 0
                 best_ckpt = {
                     'model_state': model.state_dict(),
                     'optimizer_state': optimizer.state_dict(),
@@ -1462,6 +1737,18 @@ def main():
                 }
                 torch.save(best_ckpt, args.save_path)
                 logger.info("Saved best model -> %s", args.save_path)
+            else:
+                evals_without_improve += 1
+                if args.patience > 0 and evals_without_improve >= args.patience:
+                    logger.info(
+                        "Early stopping triggered at epoch %d after %d evals without val_mrr improvement; best_epoch=%d best_val_mrr=%.4f best_val_auc=%.4f",
+                        epoch,
+                        evals_without_improve,
+                        best_epoch,
+                        best_val_mrr,
+                        best_val_auc,
+                    )
+                    break
 
     if best_ckpt is not None:
         model.load_state_dict(best_ckpt['model_state'])
@@ -1469,23 +1756,22 @@ def main():
     train_metrics, val_metrics, test_metrics = compute_metrics_fullgraph(
         model, data, train_pair, val_pair, test_pair, relation=relation,
         eval_device=args.eval_device, eval_neg_ratio=args.eval_neg_ratio,
-        host_id2taxid=host_id2taxid, taxid2species=taxid2species, k_list=(1, 5, 10, 20, 30),   # <- 这里加上
-        save_path=os.path.join(preds_dir, "phage_prediction_results"), # will generate *_train_topk.tsv etc
+        host_id2taxid=host_id2taxid, taxid2species=taxid2species, k_list=(1, 5, 10, 20, 30),
+        save_path=None,
         node_maps_path=args.node_maps,
         edge_type_weight_map=edge_type_weight_map
     )
     logger.info("FINAL TEST metrics (AUC, MRR, Hits@1/5/10): %s", test_metrics)
 
-    # Final predictions
-    final_pred_file = os.path.join(preds_dir, "phage_prediction_results_final.tsv")
-
-    save_predictions(
-        model, data, test_src_cpu, test_dst_cpu, relation, 
-        eval_device, host_id2taxid, taxid2species, 
-        output_file=final_pred_file, k_list=(30,),
-        edge_type_weight_map=edge_type_weight_map,
-        node_maps_path=args.node_maps
-    )
+    if args.save_final_predictions:
+        final_pred_file = os.path.join(preds_dir, "phage_prediction_results_final.tsv")
+        save_predictions(
+            model, data, test_src_cpu, test_dst_cpu, relation,
+            eval_device, host_id2taxid, taxid2species,
+            output_file=final_pred_file, k_list=(30,),
+            edge_type_weight_map=edge_type_weight_map,
+            node_maps_path=args.node_maps
+        )
 
 
 if __name__ == "__main__":
