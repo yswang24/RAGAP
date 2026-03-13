@@ -68,6 +68,12 @@ def safe_torch_load(path: str) -> tuple[HeteroData, typing.Union[dict, None]]:
         return obj['data'], obj.get('split_edge', None)
     raise RuntimeError("Unsupported .pt content. Please save torch.save((data, split_edge), path) or torch.save(data, path).")
 
+def select_phage_host_relation(data: HeteroData):
+    preferred = ('phage', 'infects', 'host')
+    if preferred in data.edge_types:
+        return preferred
+    return None
+
 def find_phage_host_splits(data: HeteroData, ext_splits: typing.Union[dict, None]) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
     """
     Return three pairs: (train_src, train_dst), (val_src, val_dst), (test_src, test_dst)
@@ -85,11 +91,7 @@ def find_phage_host_splits(data: HeteroData, ext_splits: typing.Union[dict, None
             pass
 
     # find phage->host relation name
-    rel = None
-    for r in data.edge_types:
-        if r[0] == 'phage' and r[2] == 'host':
-            rel = r
-            break
+    rel = select_phage_host_relation(data)
     if rel is None:
         raise RuntimeError("No ('phage',*, 'host') relation in data.edge_types")
 
@@ -1287,11 +1289,7 @@ def main():
     
     loss_fn = softmax_ce_loss  # 你自定义的对比损失
 
-    relation = None
-    for r in data.edge_types:
-        if r[0] == 'phage' and r[2] == 'host':
-            relation = r
-            break
+    relation = select_phage_host_relation(data)
     if relation is None:
         raise RuntimeError("phage->host relation not found")
 
@@ -1515,4 +1513,3 @@ python train_hgt_phage_host_weight_RBP_noleak_hard.py \
   --log_every 5\
   --out_dir  de_new_
 '''
-
