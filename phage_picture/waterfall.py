@@ -124,5 +124,5 @@ ax.grid(
 
 # ================== 7. 输出 ==================
 plt.tight_layout()
-plt.savefig('waterfull_ablation_waterfall_red_journal.svg', format='svg')
+plt.savefig('waterfull_ablation_waterfall_red_journal_change.svg', format='svg')
 plt.show()
