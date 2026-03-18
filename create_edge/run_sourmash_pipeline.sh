@@ -8,7 +8,7 @@ echo "✅ 当前 Conda 环境: $(conda info --envs | grep '*' | awk '{print $1}'
 
 #### 用户可调整的参数 ####
 INPUT_DIR="/home/wangjingyuan/wys/host_fasta_final_sequence"         # 输入：存放所有 .fasta 文件的文件夹
-WORK_DIR="work-21-HH-sequence"                # 中间结果输出目录
+WORK_DIR="work-31-HH-sequence"                # 中间结果输出目录
 KMER_SIZE=31                  # k-mer 大小
 SCALED=1000                    # scaled 参数（压缩比）
 THRESHOLD=0.8                  # 提取边时的相似性阈值

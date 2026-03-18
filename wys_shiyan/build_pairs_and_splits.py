@@ -116,6 +116,21 @@ def build_pairs(raw_pairs_path, host_catalog_path, taxonomy_path, out_dir, src_c
         print("WROTE missing_pairs_gcf.tsv", len(missing_gcf))
     return df
 
+def parse_ratios(raw):
+    if raw is None:
+        return (0.8, 0.1, 0.1)
+    if isinstance(raw, (list, tuple)):
+        values = [float(x) for x in raw]
+    else:
+        values = [float(x.strip()) for x in str(raw).split(",") if x.strip()]
+    if len(values) != 3:
+        raise RuntimeError(f"Expected exactly 3 ratios, got: {raw}")
+    total = sum(values)
+    if total <= 0:
+        raise RuntimeError(f"Split ratios must sum to a positive value, got: {raw}")
+    return tuple(x / total for x in values)
+
+
 def random_split(df, out_dir, seed=42, ratios=(0.8,0.1,0.1)):
     random.seed(seed)
     df_sh = df.sample(frac=1, random_state=seed).reset_index(drop=True)
@@ -210,11 +225,12 @@ def main():
     p.add_argument("--out_dir", default="data/processed")
     p.add_argument("--split", choices=['random','taxa'], default='random')
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--ratios", default="0.8,0.1,0.1")
     args = p.parse_args()
 
     df = build_pairs(args.raw_pairs, args.host_catalog, args.taxonomy_parquet, args.out_dir)
     if args.split == 'random':
-        random_split(df, args.out_dir, seed=args.seed)
+        random_split(df, args.out_dir, seed=args.seed, ratios=parse_ratios(args.ratios))
     else:
         taxa_split(df, args.taxonomy_parquet, args.out_dir, holdout_genus_frac=0.1, seed=args.seed)
     
