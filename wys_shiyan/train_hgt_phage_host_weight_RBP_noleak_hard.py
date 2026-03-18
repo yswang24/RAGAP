@@ -1216,6 +1216,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out_dir", default="outputs", help="directory to place all outputs (checkpoints, predictions, debug files)")
     p.add_argument("--host_cache_refresh_every", type=int, default=1, help="refresh the detached full-graph host cache every N epochs")
     p.add_argument("--relation_aggr", choices=["sum", "attention"], default="sum", help="cross-relation aggregation mode")
+    p.add_argument("--train_objective", choices=["inbatch", "fullhost"], default="inbatch", help="training objective: in-batch CE or full-host softmax")
     return p.parse_args()
 
 def bpr_loss(pos_scores, neg_scores):
@@ -1532,10 +1533,12 @@ def main():
         {"params": list(model.rel_logw.parameters()), "lr": args.lr * 0.1}
     ], weight_decay=1e-5)
     
-    loss_fn = softmax_ce_loss
     train_positive_host_map = build_positive_host_map(train_src_cpu, train_dst_cpu)
     multi_positive_phages = sum(1 for hosts in train_positive_host_map.values() if len(hosts) > 1)
     max_hosts_per_phage = max((len(hosts) for hosts in train_positive_host_map.values()), default=0)
+    train_objective_label = "full-host softmax CE" if args.train_objective == "fullhost" else "in-batch host softmax CE"
+    host_cache = None
+    host_cache_compute_device = torch.device(args.eval_device)
 
     train_loader = LinkNeighborLoader(
         data,
@@ -1566,7 +1569,8 @@ def main():
         loader_persistent_workers,
     )
     logger.info(
-        "Training objective: in-batch host softmax CE; relation_aggr=%s; multi-host phages=%d/%d max_hosts_per_phage=%d",
+        "Training objective: %s; relation_aggr=%s; multi-host phages=%d/%d max_hosts_per_phage=%d",
+        train_objective_label,
         args.relation_aggr,
         multi_positive_phages,
         len(train_positive_host_map),
@@ -1590,6 +1594,15 @@ def main():
     best_ckpt = None
 
     for epoch in range(1, args.epochs + 1):
+        if args.train_objective == "fullhost" and (host_cache is None or (epoch - 1) % args.host_cache_refresh_every == 0):
+            logger.info("[Epoch %03d] refreshing full-host cache on %s", epoch, host_cache_compute_device)
+            host_cache = refresh_full_host_cache(
+                model,
+                data,
+                compute_device=host_cache_compute_device,
+                target_device=device,
+                edge_type_weight_map=edge_type_weight_map,
+            )
         t0 = time.time()
         model.train()
         epoch_loss = 0.0
@@ -1636,14 +1649,39 @@ def main():
             if pos_src_local.numel() == 0:
                 continue
 
-            loss = loss_fn(
-                phage_emb_batch,
-                host_emb_batch,
-                pos_src_local,
-                pos_dst_local,
-                tau=args.tau,
-                logit_scale=model.logit_scale,
-            )
+            if args.train_objective == "fullhost":
+                if host_cache is None:
+                    raise RuntimeError("full-host training requested but host_cache is not initialized")
+                batch_phage_global = node_global_ids(batch, relation[0], device)
+                batch_host_global = node_global_ids(batch, relation[2], device)
+                full_host_emb = host_cache.clone()
+                full_host_emb[batch_host_global] = host_emb_batch
+                pos_phage_global = batch_phage_global[pos_src_local]
+                positive_mask = torch.zeros(
+                    (pos_src_local.size(0), full_host_emb.size(0)),
+                    dtype=torch.bool,
+                    device=device,
+                )
+                for row_idx, phage_global in enumerate(pos_phage_global.tolist()):
+                    positive_hosts = train_positive_host_map.get(int(phage_global))
+                    if positive_hosts:
+                        positive_mask[row_idx, positive_hosts] = True
+                loss = multi_positive_full_host_softmax_loss(
+                    phage_emb_batch[pos_src_local],
+                    full_host_emb,
+                    positive_mask,
+                    tau=args.tau,
+                    logit_scale=model.logit_scale,
+                )
+            else:
+                loss = softmax_ce_loss(
+                    phage_emb_batch,
+                    host_emb_batch,
+                    pos_src_local,
+                    pos_dst_local,
+                    tau=args.tau,
+                    logit_scale=model.logit_scale,
+                )
             
             # 反向传播
             loss.backward()
